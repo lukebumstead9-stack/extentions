@@ -1,0 +1,1477 @@
+// Name: CST 3D
+// ID: cst12293d
+// Description: Bring your sprites into the third dimension.
+// By: CST1229 <https://scratch.mit.edu/users/CST1229/>
+// License: MPL-2.0
+
+// OFFICIAL DOWNLOAD: https://raw.githubusercontent.com/CST1229/turbowarp-extensions/3d/extensions/CST1229/3d.js
+// Version 0.1
+
+// Special thanks:
+// Drago NrxThulitech Cuven: some bug finding
+// Everyone using this extension on other platforms: Holy, I didn't know this little extension was THIS popular...
+
+/*
+  TODO:
+  - bugs
+  
+  - model support???
+    - "load (OBJ/MTL/GLTF) (text/data: URL) [] into model []"
+    - "set 3d mode to model []"
+    - collision support unlikely (if it did happen it would probably be very laggy)
+
+  - materials/textures
+    - "set material [0] texture to [current costume]"
+    - "set material [0] color to ()"?
+    - built-in shape materials would be in docs because docs will exist (they are essential)
+
+  - 3d stamping
+    - "3d stamp named []" block that copies the current 3d object
+    - "duplicate 3d stamp [] as []"
+    - "move 3d stamp [] to myself"
+    - "delete 3d stamp []"
+    - "erase all 3d stamps"
+  
+  - lighting
+    - could be in the set 3d mode block, as in "set 3d mode to (point/spotlight)"
+    - spotlights point in the direction the sprite is pointing
+    - light color/intensity blocks
+    - glow?
+    - world light blocks (direction/disable/flat/color/intensity)
+  
+  - WHEN RELEASING, DATA-URLIFY THREEJS
+*/
+
+(async function (Scratch) {
+  "use strict";
+
+  const IN_3D = "threed.in3d";
+  const OBJECT = "threed.object";
+  const THREED_DIRTY = "threed.dirty";
+  const SIDE_MODE = "threed.sidemode";
+  const TEX_FILTER = "threed.texfilter";
+  const Z_POS = "threed.zpos";
+  const Z_STRETCH = "threed.zstretch";
+  const YAW = "threed.yaw";
+  const PITCH = "threed.pitch";
+  const ROLL = "threed.roll";
+  const ATTACHED_TO = "threed.attachedto";
+  
+  // Lighting Constants
+  const LIGHT_COLOR = "threed.lightcolor";
+  const LIGHT_INTENSITY = "threed.lightintensity";
+  const AMBIENT_COLOR = "threed.ambientcolor";
+  const AMBIENT_INTENSITY = "threed.ambientintensity";
+
+  if (!Scratch.extensions.unsandboxed) {
+    throw new Error("CST 3D must be run unsandboxed");
+  }
+
+  const extId = "cst12293d";
+
+  const vm = Scratch.vm;
+  const runtime = vm.runtime;
+  const renderer = Scratch.renderer;
+
+	const PATCHES_ID = "__patches" + extId;
+	const patch = (obj, functions) => {
+		if (obj[PATCHES_ID]) return;
+		obj[PATCHES_ID] = {};
+		for (const name in functions) {
+			const original = obj[name];
+			obj[PATCHES_ID][name] = obj[name];
+			if (original) {
+				obj[name] = function(...args) {
+					const callOriginal = (...ogArgs) => original.call(this, ...ogArgs);
+					return functions[name].call(this, callOriginal, ...args);
+				};
+			} else {
+				obj[name] = function (...args) {
+					return functions[name].call(this, () => {}, ...args);
+				}
+			}
+		}
+	}
+	const _unpatch = (obj) => {
+		if (!obj[PATCHES_ID]) return;
+		for (const name in obj[PATCHES_ID]) {
+			obj[name] = obj[PATCHES_ID][name];
+		}
+		delete obj[PATCHES_ID];
+	}
+
+  const Skin = renderer.exports.Skin;
+
+  // this class was originally made by Vadik1
+  class SimpleSkin extends Skin {
+    constructor(id, renderer) {
+      super(id, renderer);
+      const gl = renderer.gl;
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      //gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0,255,0,255]));
+      this._texture = texture;
+      /**
+       * @type {[number, number]}
+       */
+      this._rotationCenter = [240, 180];
+      /**
+       * @type {[number, number]}
+       */
+      this._size = [480, 360];
+    }
+    dispose() {
+      if (this._texture) {
+        this._renderer.gl.deleteTexture(this._texture);
+        this._texture = null;
+      }
+      super.dispose();
+    }
+    set size(value) {
+      this._size = value;
+      this._rotationCenter = [value[0] / 2, value[1] / 2];
+    }
+    get size() {
+      return this._size;
+    }
+    getTexture(scale) {
+      return this._texture || super.getTexture(scale);
+    }
+    setContent(textureData) {
+      const gl = this._renderer.gl;
+      gl.bindTexture(gl.TEXTURE_2D, this._texture);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        textureData
+      );
+      this.emitWasAltered();
+    }
+  }
+
+  // to convert to data url, use https://www.adminbooster.com/tool/data_uri
+  // @ts-expect-error we're running in a browser
+  const THREE = await import("https://cdn.jsdelivr.net/npm/three@0.176/build/three.module.min.js");
+
+
+  class ThreeD {
+    constructor() {
+      // @ts-expect-error
+      window.threed = this;
+      runtime[extId] = this;
+      this.THREE = THREE;
+      
+      // Map to store named 3D stamps
+      this.stamps = new Map(); 
+      
+      // Lighting properties
+      this.ambientLight = null;
+      this.ambientColor = 0xffffff;
+      this.ambientIntensity = 0.5;
+
+      // @ts-ignore
+      this.hideVanillaBlocks = !!runtime.extensionStorage?.[extId]?.hideVanillaBlocks;
+      runtime.on("PROJECT_LOADED", () => {
+        this.uninit();
+        const oldHideVanillaBlocks = this.hideVanillaBlocks;
+        // @ts-ignore
+        this.hideVanillaBlocks = !!runtime.extensionStorage?.[extId]?.hideVanillaBlocks;
+        if (oldHideVanillaBlocks != this.hideVanillaBlocks) {
+          vm.extensionManager.refreshBlocks();
+        }
+      });
+    }
+
+    // FIX START: Implement the missing getSprites dynamic menu function
+    getSprites() {
+      const targets = runtime.getTargets().filter(target => !target.isStage);
+      const spriteNames = targets.map(target => target.getName());
+      
+      // In Scratch 3.0, the Stage name is "Stage" (or translated equivalent).
+      // We must check if the stage target exists and include its name.
+      const stage = runtime.getTargetForStage();
+      if (stage) {
+          spriteNames.push(stage.getName());
+      }
+      return spriteNames;
+    }
+    // FIX END
+
+    getInfo() {
+      return {
+        id: extId,
+        name: Scratch.translate("CST 3D"),
+
+        color1: "#2a47e8",
+        color2: "#2439ad",
+        color3: "#1b2d94",
+
+        blocks: [
+          {
+            blockType: Scratch.BlockType.BUTTON,
+            text: Scratch.translate("Open Documentation"),
+            func: "viewDocs",
+          },
+          {
+            blockType: Scratch.BlockType.BUTTON,
+            text: this.hideVanillaBlocks ? Scratch.translate("Show Vanilla Blocks") : Scratch.translate("Hide Vanilla Blocks"),
+            func: "toggleVanillaBlocks",
+          },
+          "---",
+          {
+            opcode: "setMode",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("set 3D mode to [MODE]"),
+            arguments: {
+              MODE: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "MODE_MENU",
+                // [UPDATED] Defaulting to 'flat' to support unlit meshes
+                defaultValue: "flat", 
+              },
+            },
+          },
+          // Lighting Blocks
+          {
+            opcode: "setLightColor",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("set [LIGHT] color to [COLOR]"),
+            arguments: {
+              LIGHT: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "LIGHT_MENU",
+                defaultValue: "world ambient",
+              },
+              COLOR: {
+                type: Scratch.ArgumentType.COLOR,
+                defaultValue: "#ffffff",
+              },
+            },
+          },
+          {
+            opcode: "setLightIntensity",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("set [LIGHT] intensity to [VALUE]"),
+            arguments: {
+              LIGHT: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "LIGHT_MENU",
+                defaultValue: "world ambient",
+              },
+              VALUE: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0.5,
+              },
+            },
+          },
+          "---",
+          this.vanillaBlock(`
+            <block type="motion_setx">
+                <value name="X">
+                    <shadow id="setx" type="math_number">
+                        <field name="NUM">0</field>
+                    </shadow>
+                </value>
+            </block>
+            <block type="motion_sety">
+                <value name="Y">
+                    <shadow id="sety" type="math_number">
+                        <field name="NUM">0</field>
+                    </shadow>
+                </value>
+            </block>
+          `),
+          {
+            opcode: "setZ",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("set z to [Z]"),
+            arguments: {
+              Z: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+            },
+          },
+          this.vanillaBlock(`
+            <block type="motion_changexby">
+                <value name="DX">
+                    <shadow type="math_number">
+                        <field name="NUM">0</field>
+                    </shadow>
+                </value>
+            </block>
+            <block type="motion_changeyby">
+                <value name="DY">
+                    <shadow type="math_number">
+                        <field name="NUM">0</field>
+                    </shadow>
+                </value>
+            </block>
+          `),
+          {
+            opcode: "changeZ",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("change z by [Z]"),
+            arguments: {
+              Z: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 10,
+              },
+            },
+          },
+          this.vanillaBlock(`
+            <block type="motion_xposition"></block>
+            <block type="motion_yposition"></block>
+          `),
+          {
+            opcode: "getZ",
+            blockType: Scratch.BlockType.REPORTER,
+            text: Scratch.translate("z position"),
+          },
+          {
+            opcode: "set3DPos",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("go to x: [X] y: [Y] z: [Z]"),
+            arguments: {
+              X: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+              Y: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+              Z: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+            },
+          },
+          {
+            opcode: "change3DPos",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("change position by x: [X] y: [Y] z: [Z]"),
+            arguments: {
+              X: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 10,
+              },
+              Y: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+              Z: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+            },
+          },
+          "---",
+          {
+            opcode: "moveSteps",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("move [STEPS] steps in 3D"),
+            arguments: {
+              STEPS: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: "10",
+              },
+            },
+          },
+          {
+            opcode: "set3DDir",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("point in [DIRECTION] [DEGREES]"),
+            arguments: {
+              DIRECTION: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "direction",
+                defaultValue: "y",
+              },
+              DEGREES: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+            },
+          },
+          {
+            opcode: "rotate3D",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("turn [DIRECTION] [DEGREES] degrees"),
+            arguments: {
+              DIRECTION: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "turnDirection",
+                defaultValue: "right",
+              },
+              DEGREES: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 15,
+              },
+            },
+          },
+          {
+            opcode: "direction3D",
+            blockType: Scratch.BlockType.REPORTER,
+            text: Scratch.translate("direction around [DIRECTION]"),
+            arguments: {
+              DIRECTION: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "direction",
+                defaultValue: "y",
+              },
+            },
+          },
+          this.vanillaBlock(`
+            <block type="sensing_touchingobject">
+                <value name="TOUCHINGOBJECTMENU">
+                    <shadow type="sensing_touchingobjectmenu"/>
+                </value>
+            </block>
+          `),
+          "---",
+          {
+            opcode: "setZStretch",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("set stretch z to [STRETCH]"),
+            arguments: {
+              STRETCH: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: "100",
+              },
+            },
+          },
+          {
+            opcode: "getZStretch",
+            blockType: Scratch.BlockType.REPORTER,
+            text: Scratch.translate("stretch z"),
+          },
+          "---",
+          {
+            opcode: "setTexFilter",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("set texture filter to [FILTER]"),
+            arguments: {
+              FILTER: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "texFilter",
+                defaultValue: "nearest",
+              },
+            },
+          },
+          {
+            opcode: "setSideMode",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("set shown faces to [SIDE]"),
+            arguments: {
+              SIDE: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "side",
+                defaultValue: "both",
+              },
+            },
+          },
+          "---",
+          // START of 3D Stamping Blocks
+          {
+            opcode: "stamp3D",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("3D stamp named [NAME]"),
+            arguments: {
+              NAME: {
+                type: Scratch.ArgumentType.STRING,
+                defaultValue: "stamp1",
+              },
+            },
+          },
+          {
+            opcode: "eraseAllStamps3D",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("erase all 3D stamps"),
+            arguments: {},
+          },
+          // END of 3D Stamping Blocks
+          "---",
+          {
+            opcode: "attach",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("attach myself to [TARGET]"),
+            arguments: {
+              TARGET: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "spriteMenu",
+              },
+            },
+          },
+          {
+            opcode: "attachVar",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("attach myself to sprite with variable [VARIABLE] set to [VALUE]"),
+            arguments: {
+              TARGET: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "spriteMenu",
+              },
+              VARIABLE: {
+                type: Scratch.ArgumentType.STRING,
+                default: "my variable"
+              },
+              VALUE: {
+                type: Scratch.ArgumentType.STRING,
+                default: "0"
+              }
+            },
+          },
+          {
+            opcode: "detach",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("detach myself"),
+            arguments: {},
+          },
+          {
+            opcode: "attachedSprite",
+            blockType: Scratch.BlockType.REPORTER,
+            text: Scratch.translate("sprite I'm attached to"),
+            arguments: {},
+          },
+          {
+            opcode: "attachedSpriteVar",
+            blockType: Scratch.BlockType.REPORTER,
+            text: Scratch.translate("variable [VARIABLE] of sprite I'm attached to"),
+            arguments: {
+              VARIABLE: {
+                type: Scratch.ArgumentType.STRING,
+                default: "my variable"
+              },
+            },
+          },
+          "---",
+          {
+            opcode: "setCam",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("move camera to x: [X] y: [Y] z: [Z]"),
+            arguments: {
+              X: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+              Y: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+              Z: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+            },
+          },
+          {
+            opcode: "changeCam",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("change camera by x: [X] y: [Y] z: [Z]"),
+            arguments: {
+              X: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 10,
+              },
+              Y: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+              Z: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+            },
+          },
+          {
+            opcode: "camX",
+            blockType: Scratch.BlockType.REPORTER,
+            text: Scratch.translate("camera x"),
+          },
+          {
+            opcode: "camY",
+            blockType: Scratch.BlockType.REPORTER,
+            text: Scratch.translate("camera y"),
+          },
+          {
+            opcode: "camZ",
+            blockType: Scratch.BlockType.REPORTER,
+            text: Scratch.translate("camera z"),
+          },
+          "---",
+          {
+            opcode: "moveCamSteps",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("move camera [STEPS] steps"),
+            arguments: {
+              STEPS: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: "10",
+              },
+            },
+          },
+          {
+            opcode: "setCamDir",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("point camera in [DIRECTION] [DEGREES]"),
+            arguments: {
+              DIRECTION: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "direction",
+                defaultValue: "y",
+              },
+              DEGREES: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 0,
+              },
+            },
+          },
+          {
+            opcode: "rotateCam",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("turn camera [DIRECTION] [DEGREES] degrees"),
+            arguments: {
+              DIRECTION: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "turnDirection",
+                defaultValue: "right",
+              },
+              DEGREES: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: 15,
+              },
+            },
+          },
+          {
+            opcode: "camDir",
+            blockType: Scratch.BlockType.REPORTER,
+            text: Scratch.translate("camera direction around [DIRECTION]"),
+            arguments: {
+              DIRECTION: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "direction",
+                defaultValue: "y",
+              },
+            },
+          },
+          "---",
+          {
+            opcode: "setCameraParam",
+            blockType: Scratch.BlockType.COMMAND,
+            text: Scratch.translate("set camera [PARAM] to [VALUE]"),
+            arguments: {
+              PARAM: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "cameraParam",
+                defaultValue: "vertical FOV",
+              },
+              VALUE: {
+                type: Scratch.ArgumentType.NUMBER,
+                defaultValue: "50",
+              },
+            },
+          },
+          {
+            opcode: "getCameraParam",
+            blockType: Scratch.BlockType.REPORTER,
+            text: Scratch.translate("camera [PARAM]"),
+            arguments: {
+              PARAM: {
+                type: Scratch.ArgumentType.STRING,
+                menu: "cameraParam",
+                defaultValue: "vertical FOV",
+              },
+            },
+          },
+        ],
+        menus: {
+          MODE_MENU: {
+            acceptReporters: true,
+            items: [
+              "disabled",
+              "flat",
+              "flat triangle",
+              // [UPDATED] Added lighting mode
+              "point light", 
+              "sprite",
+              "cube",
+              "sphere",
+              "low-poly sphere",
+            ],
+          },
+          // Light selector menu
+          LIGHT_MENU: {
+            acceptReporters: true,
+            items: [
+              "world ambient",
+              "my point light",
+            ],
+          },
+          turnDirection: {
+            acceptReporters: false,
+            items: [
+              "left", "right",
+              "up", "down",
+              {
+                text: Scratch.translate("⟲"),
+                value: "ccw"
+              },
+              {
+                text: Scratch.translate("⟳"),
+                value: "cw"
+              }
+            ],
+          },
+          direction: {
+            acceptReporters: true,
+            items: [
+              {value: "y", text: Scratch.translate("y (yaw)")},
+              {value: "x", text: Scratch.translate("x (pitch)")},
+              {value: "z", text: Scratch.translate("z (roll)")},
+            ],
+          },
+          cameraParam: {
+            acceptReporters: true,
+            items: ["vertical FOV", "minimum render distance", "maximum render distance"],
+          },
+          side: {
+            acceptReporters: true,
+            items: ["both", "front", "back"]
+          },
+          texFilter: {
+            acceptReporters: true,
+            items: ["nearest", "linear"]
+          },
+
+          spriteMenu: {
+            acceptReporters: true,
+            items: "getSprites", // <-- This now correctly references the implemented function
+          },
+        },
+      };
+    }
+
+    viewDocs() {
+      alert(`This extension also makes many other vanilla blocks (e.g most of Motion) work with 3D sprites, try them out!
+Default camera position: x0, y0, z200.
+Default camera parameters: vertical FOV 60, min render distance 0.5, max render distance 4800.
+
+More things will be added here as things that need explaining are added.
+If I ever decide to release this extension on the gallery, this will be replaced with an actual docs page.`);
+    }
+
+    toggleVanillaBlocks() {
+      this.hideVanillaBlocks = !this.hideVanillaBlocks;
+      vm.extensionManager.refreshBlocks();
+      if (!runtime.extensionStorage) return;
+      if (!runtime.extensionStorage[extId]) {
+        runtime.extensionStorage[extId] = {};
+      }
+      // @ts-ignore
+      runtime.extensionStorage[extId].hideVanillaBlocks = this.hideVanillaBlocks;
+    }
+
+    vanillaBlock(xml) {
+      return {
+        blockType: Scratch.BlockType.XML,
+        xml,
+        hideFromPalette: this.hideVanillaBlocks
+      };
+    }
+
+    init() {
+      if (this.scene) return;
+
+      // create everything
+      this.scene = new THREE.Scene();
+      this.camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
+      this.camera.position.set(0, 0, 200);
+      this.camera.lookAt(0, 0, 0);
+      this.camera.near = 0.5;
+      this.camera.far = 4800;
+      
+      // Initialize Ambient Light
+      this.ambientLight = new THREE.AmbientLight(this.ambientColor, this.ambientIntensity);
+      this.scene.add(this.ambientLight);
+
+      this.renderer = new THREE.WebGLRenderer();
+      this.renderer.useLegacyLights = true;
+      this.renderer.setClearAlpha(0);
+
+      // create the scratch stuff
+      this.threeSkinId = renderer._nextSkinId++;
+      this.threeSkin = new SimpleSkin(
+        this.threeSkinId,
+        renderer
+      );
+      renderer._allSkins[this.threeSkinId] = this.threeSkin;
+      this.threeDrawableId = renderer.createDrawable("pen");
+      // @ts-expect-error not typed
+      renderer._allDrawables[this.threeDrawableId].customDrawableName = "CST 3D Layer"
+      renderer.updateDrawableSkinId(
+        this.threeDrawableId,
+        this.threeSkinId
+      );
+
+      this.stageSizeEvent = (() => {
+        this.updateScale();
+      }).bind(this);
+      vm.on("STAGE_SIZE_CHANGED", this.stageSizeEvent);
+
+      this.stampRenderTarget = new THREE.WebGLRenderTarget();
+
+      this.raycaster = new THREE.Raycaster();
+
+      this.applyPatches();
+      this.updateScale();
+    }
+
+    disable3DForDrawable(drawableID) {
+      const drawable = renderer._allDrawables[drawableID];
+      if (!drawable || !drawable[OBJECT]) return;
+      
+      // Remove Point Light if it exists
+      if (drawable[OBJECT].light) {
+          drawable[OBJECT].light.removeFromParent();
+          drawable[OBJECT].light = null;
+          delete drawable[LIGHT_COLOR];
+          delete drawable[LIGHT_INTENSITY];
+      }
+
+      const obj = drawable[OBJECT];
+      // Dispose of Three.js objects to prevent memory leaks
+      obj.geometry.dispose();
+      obj.material.dispose();
+      if (obj.material.map) obj.material.map.dispose();
+      obj.removeFromParent();
+
+      // Clear all 3D specific properties
+      delete drawable[IN_3D];
+      delete drawable[OBJECT];
+      delete drawable[THREED_DIRTY];
+      delete drawable[SIDE_MODE];
+      delete drawable[TEX_FILTER];
+      delete drawable[Z_POS];
+      delete drawable[Z_STRETCH];
+      delete drawable[YAW];
+      delete drawable[PITCH];
+      delete drawable[ROLL];
+      delete drawable[ATTACHED_TO];
+      this.updateRenderer();
+    }
+
+    uninit() {
+      // delete everything
+      for (const dr of renderer._allDrawables) {
+        if (!dr) continue;
+        this.disable3DForDrawable(dr.id);
+        delete dr[IN_3D];
+        delete dr[OBJECT];
+      }
+      this.eraseAllStamps3D(); 
+      
+      // Clean up ambient light
+      if (this.ambientLight) {
+          this.ambientLight.removeFromParent();
+          this.ambientLight = null;
+      }
+      
+      if (this.scene) this.scene.clear();
+      this.scene = undefined;
+      this.camera = undefined;
+      if (this.renderer) this.renderer.dispose();
+      this.renderer = undefined;
+      if (this.threeSkinId)
+        this.threeSkin.dispose();
+      this.threeSkinId = undefined;
+      if (this.threeDrawableId)
+        renderer._allDrawables[this.threeDrawableId].dispose();
+      this.threeDrawableId = undefined;
+      if (this.stageSizeEvent)
+        vm.off("STAGE_SIZE_CHANGED", this.stageSizeEvent);
+      this.stageSizeEvent = undefined;
+      if (this.stampRenderTarget)
+        this.stampRenderTarget.dispose();
+      this.stampRenderTarget = undefined;
+
+      runtime.requestRedraw();
+    }
+
+    // call when the native size of the canvas changes
+    updateScale() {
+      const w = runtime.stageWidth || 480;
+      const h = runtime.stageHeight || 360;
+
+      this.threeSkin.size = [w, h];
+
+      this.camera.aspect = w / h;
+      this.renderer.setSize(w, h);
+      this.stampRenderTarget.setSize(w, h);
+      this.camera.updateProjectionMatrix();
+
+      this.updateRenderer();
+    }
+
+    // patches for stuff
+    applyPatches() {
+      const Drawable = renderer.exports.Drawable;
+
+      const threed = this;
+      patch(Drawable.prototype, {
+        getVisible(og) {
+          if (this[IN_3D]) return false;
+          return og();
+        },
+        updateVisible(og, value) {
+          if (this[IN_3D]) {
+            const o = this[OBJECT];
+            if (o.visible !== value) {
+              o.visible = value;
+              threed.updateRenderer();
+            }
+          }
+          return og(value);
+        },
+        updatePosition(og, position) {
+          if (this[IN_3D]) {
+            const o = this[OBJECT];
+            o.position.x = position[0];
+            o.position.y = position[1];
+            // Update PointLight position if attached
+            if (o.light) {
+                o.light.position.set(position[0], position[1], this[Z_POS] || 0);
+            }
+            threed.updateRenderer();
+          }
+          return og(position);
+        },
+        updateDirection(og, direction) {
+          if (this[IN_3D]) {
+            this[ROLL] = THREE.MathUtils.degToRad(direction);
+            threed.updateSpriteAngle(this);
+            threed.updateRenderer();
+          }
+          return og(direction);
+        },
+        updateScale(og, scale) {
+          if (this[IN_3D]) {
+            const obj = this[OBJECT];
+            obj.scale.x = (obj._sizeX ?? 100) / 100 * scale[0];
+            obj.scale.y = (obj._sizeY ?? 100) / 100 * scale[1];
+            obj.scale.z = (obj._sizeZ ?? 100) / 100 * (this[Z_STRETCH] ?? scale[0]);
+            threed.updateRenderer();
+          }
+          return og(scale);
+        },
+        dispose(og) {
+          // Use the cleanup function
+          if (this[OBJECT]) {
+            threed.disable3DForDrawable(this._id);
+            this[OBJECT] = null; 
+          }
+          return og();
+        },
+        _skinWasAltered(og) {
+          og();
+          if (this[IN_3D]) {
+            threed.updateDrawableSkin(this);
+            threed.updateRenderer();
+          }
+        }
+      });
+      
+      patch(renderer, {
+        draw(og) {
+          if (this[THREED_DIRTY]) {
+            // Do a 3D redraw
+            threed.doUpdateRenderer();
+            this[THREED_DIRTY] = false;
+          }
+          return og();
+        },
+        // ... (rest of renderer patches are unchanged)
+        isTouchingDrawables(og, drawableID, candidateIDs = this._drawList) {
+          const dr = this._allDrawables[drawableID];
+
+          if (dr[IN_3D]) {
+            // 3D sprites can't collide with 2D
+            const candidates = candidateIDs.filter(id => this._allDrawables[id][IN_3D]);
+            for (const candidate of candidates) {
+              if (threed.touching3D(dr[OBJECT], this._allDrawables[candidate][OBJECT]))
+                return true;
+            }
+            return false;
+          }
+
+          return og(drawableID, candidateIDs.filter(id => !(this._allDrawables[id][IN_3D])));
+        },
+
+        penStamp(og, penSkinID, stampID) {
+          const dr = this._allDrawables[stampID];
+          if (!dr) return;
+          if (dr[IN_3D]) {
+            // Draw the sprite to the 3D drawable then stamp it
+            threed.renderer.render(dr[OBJECT], threed.camera);
+            this._allSkins[threed.threeSkinId].setContent(
+              threed.renderer.domElement
+            );
+            og(penSkinID, threed.threeDrawableId);
+            threed.updateRenderer();
+            return;
+          }
+          return og(penSkinID, stampID);
+        },
+
+        pick(og, centerX, centerY, touchWidth, touchHeight, candidateIDs) {
+          const pick2d = og(centerX, centerY, touchWidth, touchHeight, candidateIDs);
+          if (pick2d !== -1) return pick2d;
+          
+          if (!threed.raycaster) return false;
+
+          const bounds = this.clientSpaceToScratchBounds(centerX, centerY, touchWidth, touchHeight);
+          if (bounds.left === -Infinity || bounds.bottom === -Infinity) {
+              return false;
+          }
+
+          const candidates =
+            (candidateIDs || this._drawList).map(id => this._allDrawables[id]).filter(dr => dr[IN_3D]);
+          if (candidates.length <= 0) return -1;
+
+          const scratchCenterX = (bounds.left + bounds.right) / this._gl.canvas.clientWidth;
+          const scratchCenterY = (bounds.top + bounds.bottom) / this._gl.canvas.clientHeight;
+          threed.raycaster.setFromCamera(new THREE.Vector2(scratchCenterX, scratchCenterY), threed.camera);
+
+          const object = threed.raycaster.intersectObject(threed.scene, true)[0]?.object;
+          if (!object) return -1;
+          const drawable = candidates.find(c => (c[IN_3D] && c[OBJECT] === object));
+          if (!drawable) return -1;
+          return drawable._id;
+        },
+        drawableTouching(og, drawableID, centerX, centerY, touchWidth, touchHeight) {
+          const drawable = this._allDrawables[drawableID];
+          if (!drawable) {
+              return false;
+          }
+          if (!drawable[IN_3D]) {
+            return og(drawableID, centerX, centerY, touchWidth, touchHeight);
+          }
+  
+          if (!threed.raycaster) return false;
+  
+          const bounds = this.clientSpaceToScratchBounds(centerX, centerY, touchWidth, touchHeight);
+          const scratchCenterX = (bounds.left + bounds.right) / this._gl.canvas.clientWidth;
+          const scratchCenterY = (bounds.top + bounds.bottom) / this._gl.canvas.clientHeight;
+          threed.raycaster.setFromCamera(new THREE.Vector2(scratchCenterX, scratchCenterY), threed.camera);
+  
+          const intersect = (threed.raycaster.intersectObject(threed.scene, true));
+          const object = intersect[0]?.object;
+          return object === drawable[OBJECT];
+        },
+        extractDrawableScreenSpace(og, drawableID) {
+          const drawable = this._allDrawables[drawableID];
+          if (!drawable)
+            throw new Error(`Could not extract drawable with ID ${drawableID}; it does not exist`);
+          if (!drawable[IN_3D])
+            return og(drawableID);
+
+          // Draw the sprite to the 3D drawable then extract it
+          threed.renderer.render(drawable[OBJECT], threed.camera);
+          this._allSkins[threed.threeSkinId].setContent(
+            threed.renderer.domElement
+          );
+          const extracted = og(threed.threeDrawableId);
+          threed.updateRenderer();
+          return extracted;
+        },
+      });
+      patch(renderer.exports.Skin, {
+        dispose(og) {
+          if (this._3dCachedTexture) this._3dCachedTexture.dispose();
+          og();
+          // Clear textures on stamps that used this skin's texture upon disposal
+          threed.stamps.forEach(stamp => {
+            if (stamp.material.map === this._3dCachedTexture) {
+              stamp.material.map = null;
+              threed.updateRenderer();
+            }
+          });
+        },
+        _setTexture(og, textureData) {
+          if (this._3dCachedTexture) {
+            this._3dCachedTexture.dispose();
+            this._3dCachedTexture = null;
+            const returnValue = og(textureData);
+            threed.getThreeTextureFromSkin(this);
+            return returnValue;
+          }
+          return og(textureData);
+        },
+      });
+    }
+
+    updateRenderer() {
+      // Schedule a 3D redraw
+      renderer[THREED_DIRTY] = true;
+      runtime.requestRedraw();
+    }
+
+    // pushes the current 3d render state into the drawable
+    doUpdateRenderer() {
+      this.init();
+      this.renderer.render(this.scene, this.camera);
+
+      if (!this.threeSkinId) return;
+
+      this.threeSkin.setContent(
+        this.renderer.domElement
+      );
+    }
+
+    updateDrawableSkin(drawable) {
+      if (drawable[OBJECT] && drawable[OBJECT].material) {
+        drawable[OBJECT].material.map = this.getThreeTextureFromSkin(drawable.skin);
+        drawable[OBJECT].material.needsUpdate = true;
+      }
+    }
+    
+    // [FIXED] Implementation of getCanvasFromSkin
+    /**
+     * Extracts the Skin's texture data onto a Canvas for use in Three.js.
+     * @param {Skin} skin The Scratch Skin object.
+     * @returns {HTMLCanvasElement} A canvas containing the skin texture.
+     */
+    getCanvasFromSkin(skin) {
+        if (!skin._canvas) {
+            skin._canvas = document.createElement('canvas');
+            skin._context = skin._canvas.getContext('2d');
+        }
+        
+        const canvas = skin._canvas;
+        const ctx = skin._context;
+        const size = skin.size;
+        
+        canvas.width = size[0];
+        canvas.height = size[1];
+        
+        // This attempts to get the underlying image data (Bitmap skin) or canvas (Vector skin)
+        const img = skin._image || skin._canvas; 
+        
+        if (img) {
+            ctx.clearRect(0, 0, size[0], size[1]);
+            // Draw the image data, scaled to fit the canvas size.
+            ctx.drawImage(img, 0, 0, size[0], size[1]);
+        } else {
+             // Fallback: Use a placeholder color if no image data is available
+            ctx.fillStyle = '#ff00ff'; 
+            ctx.fillRect(0, 0, size[0], size[1]);
+        }
+        
+        return canvas;
+    }
+
+    getThreeTextureFromSkin(skin) {
+      if (!skin._3dCachedTexture || skin._3dCachedTexture._needsUpdate) {
+          if (skin._3dCachedTexture) skin._3dCachedTexture.dispose();
+          
+          const canvas = this.getCanvasFromSkin(skin);
+          skin._3dCachedTexture = new THREE.CanvasTexture(canvas);
+          skin._3dCachedTexture.colorSpace = THREE.SRGBColorSpace;
+          skin._3dCachedTexture.needsUpdate = true; // Mark as fresh
+          
+          // Apply texture filter setting
+          const filter = skin[TEX_FILTER] || 'nearest';
+          if (filter === 'nearest') {
+              skin._3dCachedTexture.minFilter = THREE.NearestFilter;
+              skin._3dCachedTexture.magFilter = THREE.NearestFilter;
+          } else if (filter === 'linear') {
+              skin._3dCachedTexture.minFilter = THREE.LinearMipmapLinearFilter;
+              skin._3dCachedTexture.magFilter = THREE.LinearFilter;
+          }
+      }
+      return skin._3dCachedTexture;
+    }
+
+    // Helper to switch materials to support lighting
+    _updateMaterial(drawable, isLit) {
+        const obj = drawable[OBJECT];
+        const oldMaterial = obj.material;
+        
+        // Use MeshPhongMaterial (supports lighting) or MeshBasicMaterial (unlit)
+        const newMaterialClass = isLit ? THREE.MeshPhongMaterial : THREE.MeshBasicMaterial;
+        
+        // If material already exists and is the correct type, just return
+        if (oldMaterial && oldMaterial.constructor === newMaterialClass) {
+            return;
+        }
+
+        // Create new material
+        const newMaterial = new newMaterialClass({
+            color: oldMaterial.color,
+            map: oldMaterial.map,
+            side: oldMaterial.side,
+            transparent: oldMaterial.transparent,
+            alphaTest: oldMaterial.alphaTest,
+        });
+
+        // Copy material properties (color, texture, transparency, etc.)
+        newMaterial.color.setHex(drawable[LIGHT_COLOR] || 0xffffff);
+        newMaterial.side = oldMaterial.side;
+        newMaterial.map = oldMaterial.map;
+
+        // Dispose of the old material to free up resources
+        if (oldMaterial) {
+            oldMaterial.dispose();
+            oldMaterial.map = null;
+        }
+
+        obj.material = newMaterial;
+        obj.material.needsUpdate = true;
+    }
+    
+    // [UPDATED] setMode: Added lighting setup
+    setMode(args, util) {
+        this.init();
+        const mode = Scratch.Cast.toString(args.MODE);
+        const drawable = util.target.drawable;
+        
+        // If switching from one 3D mode to another, or from a lit to unlit mode
+        if (drawable[IN_3D]) {
+            // Cleanup light object if mode is changing
+            if (drawable[OBJECT] && drawable[OBJECT].light) {
+                drawable[OBJECT].light.removeFromParent();
+                drawable[OBJECT].light = null;
+            }
+            if (mode === 'disabled') {
+                this.disable3DForDrawable(drawable.id);
+                return;
+            }
+        } else if (mode === 'disabled') {
+            return; // Already disabled
+        }
+
+        // Prepare lighting state
+        const isLit = mode === "point light"; // Only "point light" uses a lit material for now
+        
+        // Initialize 3D Object (Mesh) and set material
+        let object = drawable[OBJECT];
+        let geometry;
+
+        if (!object) {
+            // Initial creation (default to BoxGeometry)
+            geometry = new THREE.BoxGeometry(100, 100, 100);
+            const initialMaterial = isLit ? new THREE.MeshPhongMaterial() : new THREE.MeshBasicMaterial();
+            object = new THREE.Mesh(geometry, initialMaterial);
+            object._sizeX = 100;
+            object._sizeY = 100;
+            object._sizeZ = 100;
+            
+            this.scene.add(object);
+            drawable[OBJECT] = object;
+            drawable[IN_3D] = true;
+            drawable[Z_POS] = drawable[Z_POS] ?? 0;
+            drawable[LIGHT_COLOR] = 0xffffff;
+            drawable[LIGHT_INTENSITY] = 1.0;
+        } else {
+            // Switch material type if needed
+            this._updateMaterial(drawable, isLit);
+            
+            // Switch geometry if needed (basic shapes for now)
+            if (mode === "cube" || mode === "flat" || mode === "point light") {
+                geometry = new THREE.BoxGeometry(100, 100, 100);
+            } else if (mode === "sphere") {
+                geometry = new THREE.SphereGeometry(50, 32, 16);
+            } else {
+                geometry = object.geometry; // Keep current geometry for unknown modes
+            }
+            
+            if (object.geometry.constructor !== geometry.constructor) {
+                 object.geometry.dispose();
+                 object.geometry = geometry;
+            }
+        }
+        
+        // Handle Point Light Mode (sprite acts as a light source)
+        if (isLit) {
+            // Create and attach PointLight
+            const light = new THREE.PointLight(drawable[LIGHT_COLOR], drawable[LIGHT_INTENSITY], 0, 2); // 0 distance is infinite
+            light.position.set(drawable.position[0], drawable.position[1], drawable[Z_POS] || 0);
+            this.scene.add(light);
+            drawable[OBJECT].light = light; // Attach light to the object for reference
+            drawable[OBJECT].material.color.setHex(0xffffff); // Lit material uses color for lighting, so base color is white
+            drawable[OBJECT].material.needsUpdate = true;
+        }
+
+        // Ensure proper skin and rendering
+        this.updateDrawableSkin(drawable);
+        this.updateRenderer();
+    }
+    
+    // Block to set light color
+    setLightColor(args, util) {
+        this.init();
+        const lightName = Scratch.Cast.toString(args.LIGHT);
+        const color = Scratch.Cast.toColor(args.COLOR);
+        const colorHex = THREE.Color.getHex(color);
+
+        if (lightName === 'world ambient') {
+            this.ambientColor = colorHex;
+            if (this.ambientLight) {
+                this.ambientLight.color.set(colorHex);
+            }
+        } else if (lightName === 'my point light') {
+            const drawable = util.target.drawable;
+            drawable[LIGHT_COLOR] = colorHex;
+            if (drawable[OBJECT] && drawable[OBJECT].light) {
+                drawable[OBJECT].light.color.set(colorHex);
+            }
+        }
+        this.updateRenderer();
+    }
+    
+    // Block to set light intensity
+    setLightIntensity(args, util) {
+        this.init();
+        const lightName = Scratch.Cast.toString(args.LIGHT);
+        // Intensity clamped to 0 or greater
+        const intensity = Math.max(0, Scratch.Cast.toNumber(args.VALUE)); 
+
+        if (lightName === 'world ambient') {
+            this.ambientIntensity = intensity;
+            if (this.ambientLight) {
+                this.ambientLight.intensity = intensity;
+            }
+        } else if (lightName === 'my point light') {
+            const drawable = util.target.drawable;
+            drawable[LIGHT_INTENSITY] = intensity;
+            if (drawable[OBJECT] && drawable[OBJECT].light) {
+                drawable[OBJECT].light.intensity = intensity;
+            }
+        }
+        this.updateRenderer();
+    }
+    
+    /// MISC OBJECT UTILS ////
+    
+    // 3D STAMPING BLOCKS
+    
+    /**
+     * Creates a copy of the sprite's current 3D object and adds it to the scene as a named stamp.
+     * @param {object} args - The block arguments.
+     * @param {object} util - The Scratch block utility object.
+     */
+    stamp3D(args, util) {
+      this.init();
+      const drawable = util.target.drawable;
+      const object = drawable[OBJECT];
+      const name = Scratch.Cast.toString(args.NAME);
+
+      if (!object) {
+        return;
+      }
+
+      if (this.stamps.has(name)) {
+        const oldStamp = this.stamps.get(name);
+        // Dispose of old stamp's components
+        oldStamp.geometry.dispose();
+        oldStamp.material.dispose();
+        if (oldStamp.material.map) oldStamp.material.map.dispose();
+        oldStamp.removeFromParent();
+      }
+
+      // Clone the object, geometry, and material 
+      const newObject = object.clone();
+      newObject.geometry = object.geometry.clone();
+      newObject.material = object.material.clone();
+      
+      if (object.material.map) {
+        newObject.material.map = object.material.map.clone();
+      }
+      
+      // If the source sprite had a light, the stamp does not inherit it
+      if (newObject.light) {
+          newObject.light = null;
+      }
+
+      this.scene.add(newObject);
+      this.stamps.set(name, newObject);
+      this.updateRenderer();
+    }
+
+    /**
+     * Removes all 3D stamps from the scene.
+     */
+    eraseAllStamps3D() {
+      this.init();
+      for (const stamp of this.stamps.values()) {
+        stamp.geometry.dispose();
+        stamp.material.dispose();
+        if (stamp.material.map) stamp.material.map.dispose();
+        stamp.removeFromParent();
+      }
+      this.stamps.clear();
+      this.updateRenderer();
+    }
+    
+    // [STUB] Placeholder for other missing functions that were used
+    updateSpriteAngle(drawable) {
+      // Logic for Yaw/Pitch/Roll updates based on Scratch direction/rotation blocks
+    }
+    touching3D(obj1, obj2) {
+      // Simple bounding box or raycasting intersection check for collision
+      return false;
+    }
+
+    // [STUB] Placeholder for attachment blocks
+    attach(args, util) {}
+    attachVar(args, util) {}
+    detach(args, util) {}
+    attachedSprite(args, util) { return ""; }
+    attachedSpriteVar(args, util) { return ""; }
+    
+    // [STUB] Placeholder for camera blocks
+    setCam(args, util) {}
+    changeCam(args, util) {}
+    camX(args, util) { return 0; }
+    camY(args, util) { return 0; }
+    camZ(args, util) { return 0; }
+    moveCamSteps(args, util) {}
+    setCamDir(args, util) {}
+    rotateCam(args, util) {}
+    camDir(args, util) { return 0; }
+    setCameraParam(args, util) {}
+    getCameraParam(args, util) { return 0; }
+    // [STUB] Placeholder for 3D Movement
+    moveSteps(args, util) {}
+    set3DDir(args, util) {}
+    rotate3D(args, util) {}
+    direction3D(args, util) { return 0; }
+    
+    // [STUB] Placeholder for stretch/filter
+    setZStretch(args, util) {}
+    getZStretch(args, util) { return 0; }
+    setTexFilter(args, util) {}
+    setSideMode(args, util) {}
+    
+    // [STUB] Placeholder for position blocks
+    setZ(args, util) {}
+    changeZ(args, util) {}
+    getZ(args, util) { return 0; }
+    set3DPos(args, util) {}
+    change3DPos(args, util) {}
+  }
+
+  if (Scratch.extensions.loadedExtensions.includes(extId)) {
+    // @ts-ignore
+    window.threed.uninit();
+    Scratch.extensions.loadedExtensions.splice(Scratch.extensions.loadedExtensions.indexOf(extId), 1);
+  }
+  Scratch.extensions.register(new ThreeD());
+})(Scratch);
